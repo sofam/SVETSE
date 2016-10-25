@@ -1,48 +1,3 @@
-// Copyright 2011 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
-/*
-Generating random text: a Markov chain algorithm
-
-Based on the program presented in the "Design and Implementation" chapter
-of The Practice of Programming (Kernighan and Pike, Addison-Wesley 1999).
-See also Computer Recreations, Scientific American 260, 122 - 125 (1989).
-
-A Markov chain algorithm generates text by creating a statistical model of
-potential textual suffixes for a given prefix. Consider this text:
-
-	I am not a number! I am a free man!
-
-Our Markov chain algorithm would arrange this text into this set of prefixes
-and suffixes, or "chain": (This table assumes a prefix length of two words.)
-
-	Prefix       Suffix
-
-	"" ""        I
-	"" I         am
-	I am         a
-	I am         not
-	a free       man!
-	am a         free
-	am not       a
-	a number!    I
-	number! I    am
-	not a        number!
-
-To generate text using this table we select an initial prefix ("I am", for
-example), choose one of the suffixes associated with that prefix at random
-with probability determined by the input statistics ("a"),
-and then create a new prefix by removing the first word from the prefix
-and appending the suffix (making the new prefix is "am a"). Repeat this process
-until we can't find any suffixes for the current prefix or we exceed the word
-limit. (The word limit is necessary as the chain table may contain cycles.)
-
-Our version of this program reads text from standard input, parsing it into a
-Markov chain, and writes generated text to standard output.
-The prefix and output lengths can be specified using the -prefix and -words
-flags on the command-line.
-*/
 package main
 
 import (
@@ -51,11 +6,44 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"time"
+
+	irc "github.com/fluffle/goirc/client"
 )
+
+var c *Chain
+var numWords *int
+var prefixLen *int
+var server *string
+var channel *string
+
+var myNick *string
+
+var mutex *sync.Mutex
+
+var replyChannel chan string
+var learnChannel chan string
+
+func init() {
+	rand.Seed(time.Now().UnixNano()) // Seed the random number generator.
+	numWords = flag.Int("words", 100, "maximum number of words to print")
+	prefixLen = flag.Int("prefix", 2, "prefix length in words")
+	server = flag.String("server", "irc.efnet.org", "server to connect to (irc.something.net:6667)")
+	channel = flag.String("channel", "#chatbotpurgatory", "channel to join")
+	myNick = flag.String("nickname", "SVETSE", "nickname for the bot")
+
+	mutex = &sync.Mutex{}
+
+	flag.Parse() // Parse command-line flags.
+
+	replyChannel = make(chan string)
+	learnChannel = make(chan string)
+}
 
 // Prefix is a Markov chain prefix of one or more words.
 type Prefix []string
@@ -75,8 +63,8 @@ func (p Prefix) Shift(word string) {
 // A prefix is a string of prefixLen words joined with spaces.
 // A suffix is a single word. A prefix can have multiple suffixes.
 type Chain struct {
-	chain     map[string][]string
-	prefixLen int
+	MapChain  map[string][]string
+	PrefixLen int
 }
 
 // NewChain returns a new Chain with prefixes of prefixLen words.
@@ -86,9 +74,9 @@ func NewChain(prefixLen int) *Chain {
 
 // Build reads text from the provided Reader and
 // parses it into prefixes and suffixes that are stored in Chain.
-func (c *Chain) Build(r io.Reader) {
+func (c *Chain) Build(r io.Reader) bool {
 	br := bufio.NewReader(r)
-	p := make(Prefix, c.prefixLen)
+	p := make(Prefix, c.PrefixLen)
 	for {
 		var s string
 		if _, err := fmt.Fscan(br, &s); err != nil {
@@ -96,17 +84,22 @@ func (c *Chain) Build(r io.Reader) {
 		}
 		s = strings.ToLower(s)
 		key := p.String()
-		c.chain[key] = append(c.chain[key], s)
+		mutex.Lock()
+		c.MapChain[key] = append(c.MapChain[key], s)
+		mutex.Unlock()
 		p.Shift(s)
 	}
+	return true
 }
 
 // Generate returns a string of at most n words generated from Chain.
 func (c *Chain) Generate(n int) string {
-	p := make(Prefix, c.prefixLen)
+	p := make(Prefix, c.PrefixLen)
 	var words []string
 	for i := 0; i < n; i++ {
-		choices := c.chain[p.String()]
+		mutex.Lock()
+		choices := c.MapChain[p.String()]
+		mutex.Unlock()
 		if len(choices) == 0 {
 			break
 		}
@@ -117,25 +110,105 @@ func (c *Chain) Generate(n int) string {
 	return strings.Join(words, " ")
 }
 
-func main() {
-	// Register command-line flags.
-	numWords := flag.Int("words", 100, "maximum number of words to print")
-	prefixLen := flag.Int("prefix", 2, "prefix length in words")
+func ircConfig() *irc.Config {
+	cfg := irc.NewConfig(*myNick)
+	cfg.SSL = false
+	cfg.Server = *server
+	cfg.NewNick = func(n string) string { return n + "^" }
+	return cfg
+}
 
-	flag.Parse()                     // Parse command-line flags.
-	rand.Seed(time.Now().UnixNano()) // Seed the random number generator.
+func handlePrivMsg(conn *irc.Conn, line *irc.Line) {
+	cleanText := ""
+	if strings.Contains(line.Text(), *myNick) {
+		// Reply if the text contains my nickname
+		cleanText = strings.TrimPrefix(line.Text(), *myNick+": ")
+		cleanText = strings.TrimPrefix(cleanText, *myNick+":")
+		cleanText = strings.Replace(cleanText, *myNick, "", -1)
+		//c.Build(strings.NewReader(cleanText))
+		learnChannel <- cleanText
+		replyChannel <- ""     // Send an empty request
+		text := <-replyChannel // Get a reply back
+		conn.Privmsg(*channel, text)
+		log.Println(text)
+		//log.Println(c.MapChain)
+	} else {
+		// Else just learn from the input
+		//c.Build(strings.NewReader(cleanText))
+		learnChannel <- line.Text()
+	}
+}
+
+func learn() {
+	for {
+		text := <-learnChannel
+		log.Printf("Learned the following: %s\n", text)
+		_ = c.Build(strings.NewReader(text))
+	}
+}
+
+func getReply() {
+	for {
+		<-replyChannel
+		reply := c.Generate(*numWords)
+		log.Printf("Replying with: %s\n", reply)
+		replyChannel <- reply
+	}
+}
+
+func saveBrain(f *os.File) {
+	for {
+		time.Sleep(time.Second * 10)
+		log.Println("Saving brain...")
+		enc := gob.NewEncoder(f)
+		mutex.Lock()
+		err := enc.Encode(c)
+		mutex.Unlock()
+		if err != nil {
+			log.Printf("Could not save brain to disk: %s\n", err)
+		}
+	}
+}
+
+func main() {
+	quit := make(chan bool)
+
 	f, err := os.OpenFile("brain.gob", os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		panic("Could not open file")
 	}
-	enc := gob.NewEncoder(f)
+
 	dec := gob.NewDecoder(f)
 
-	c := NewChain(*prefixLen) // Initialize a new Chain.
-	for {
-		c.Build(os.Stdin)             // Build chains from standard input.
-		text := c.Generate(*numWords) // Generate text.
-		fmt.Println(text)             // Write text to standard output.
-		fmt.Println(c.chain)
+	err = dec.Decode(&c)
+	if err != nil {
+		fmt.Printf("Could not load brain gob: %s\n", err)
+		c = NewChain(*prefixLen) // Initialize a new Chain.
+		fmt.Println("Generating new brain")
 	}
+
+	// Start goroutines
+	go learn()
+	go getReply()
+	go saveBrain(f)
+
+	client := irc.Client(ircConfig())
+	client.HandleFunc(irc.CONNECTED, func(conn *irc.Conn, line *irc.Line) {
+		conn.Join(*channel)
+	})
+	client.HandleFunc(irc.DISCONNECTED, func(conn *irc.Conn, line *irc.Line) {
+		quit <- true
+	})
+	client.HandleFunc(irc.PRIVMSG, handlePrivMsg)
+
+	err = client.Connect()
+	if err != nil {
+		log.Fatalf("Could not connect to IRC: %s", err)
+	}
+
+	for {
+		<-quit
+		os.Exit(0)
+	}
+
 }
