@@ -125,9 +125,14 @@ func handlePrivMsg(conn *irc.Conn, line *irc.Line) {
 		cleanText = strings.TrimPrefix(line.Text(), *myNick+": ")
 		cleanText = strings.TrimPrefix(cleanText, *myNick+":")
 		cleanText = strings.Replace(cleanText, *myNick, "", -1)
+		if len(cleanText) <= 0 {
+			replyChannel <- ""
+			text := <-replyChannel
+			conn.Privmsg(*channel, text)
+		}
 		//c.Build(strings.NewReader(cleanText))
 		learnChannel <- cleanText
-		replyChannel <- ""     // Send an empty request
+		replyChannel <- ""     // Send an empty request, until I implement contextual sentence generation
 		text := <-replyChannel // Get a reply back
 		conn.Privmsg(*channel, text)
 		log.Println(text)
@@ -168,6 +173,18 @@ func saveBrain(f *os.File) {
 			log.Printf("Could not save brain to disk: %s\n", err)
 		}
 	}
+}
+
+// keywords finds all words that exist in the conversation chain and returns an array of keywords
+func (c *Chain) keywords(i string) []string {
+	var myKeywords []string
+	words := strings.Fields(i)
+	for _, keyword := range words {
+		if len(c.MapChain[keyword]) > 0 {
+			myKeywords = append(myKeywords, keyword)
+		}
+	}
+	return myKeywords
 }
 
 func main() {
